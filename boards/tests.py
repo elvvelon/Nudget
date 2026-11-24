@@ -211,3 +211,157 @@ class ColumnTests(BoardAPITestCase):
         response = self.client.delete(f"/api/columns/{self.todo.id}/")
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class CardTests(BoardAPITestCase):
+    def create_card(self, column=None, **data):
+        column = column or self.todo
+        return self.client.post(
+            f"/api/columns/{column.id}/cards/", {"title": "Write tests", **data}
+        )
+
+    def test_member_creates_card_and_activity_is_logged(self):
+        self.login(self.member)
+
+        response = self.create_card(priority="high")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["priority"], "high")
+        card = Card.objects.get(pk=response.data["id"])
+        self.assertEqual(card.activities.get().action_type, "created")
+
+    def test_viewer_cannot_create_card(self):
+        self.login(self.viewer)
+
+        response = self.create_card()
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_new_cards_go_to_the_end_of_the_column(self):
+        first = self.create_card().data
+        second = self.create_card().data
+
+        self.assertEqual((first["position"], second["position"]), (0, 1))
+
+    def test_assignee_must_be_board_member(self):
+        response = self.create_card(assignee_id=self.outsider.id)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("assignee_id", response.data)
+
+    def test_card_cannot_move_to_another_board(self):
+        card_id = self.create_card().data["id"]
+        other_board_id = self.client.post("/api/boards/", {"title": "Other"}).data["id"]
+        foreign_column = Column.objects.filter(board_id=other_board_id).first()
+
+        response = self.client.patch(
+            f"/api/cards/{card_id}/", {"column_id": foreign_column.id}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("column_id", response.data)
+
+    def test_moving_card_logs_moved_activity(self):
+        card_id = self.create_card().data["id"]
+
+        response = self.client.patch(f"/api/cards/{card_id}/", {"column_id": self.done.id})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        moved = CardActivity.objects.get(card_id=card_id, action_type="moved")
+        self.assertEqual(moved.source_column, self.todo)
+        self.assertEqual(moved.destination_column, self.done)
+
+    def test_assigning_and_editing_card_are_logged(self):
+        card_id = self.create_card().data["id"]
+
+        self.client.patch(
+            f"/api/cards/{card_id}/", {"assignee_id": self.member.id, "title": "Write more tests"}
+        )
+
+        actions = set(
+            CardActivity.objects.filter(card_id=card_id).values_list("action_type", flat=True)
+        )
+        self.assertEqual(actions, {"created", "updated", "assigned"})
+
+    def test_viewer_can_read_card_with_history(self):
+        card_id = self.create_card().data["id"]
+        self.login(self.viewer)
+
+        response = self.client.get(f"/api/cards/{card_id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["activities"]), 1)
+        self.assertEqual(response.data["subtasks"], [])
+
+    def test_viewer_cannot_edit_or_delete_card(self):
+        card_id = self.create_card().data["id"]
+        self.login(self.viewer)
+
+        patch = self.client.patch(f"/api/cards/{card_id}/", {"title": "Hacked"})
+        delete = self.client.delete(f"/api/cards/{card_id}/")
+
+        self.assertEqual(patch.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(delete.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_outsider_gets_404_for_card(self):
+        card_id = self.create_card().data["id"]
+        self.login(self.outsider)
+
+        response = self.client.get(f"/api/cards/{card_id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_member_deletes_card(self):
+        card_id = self.create_card().data["id"]
+        self.login(self.member)
+
+        response = self.client.delete(f"/api/cards/{card_id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Card.objects.filter(pk=card_id).exists())
+
+
+class SubtaskTests(BoardAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.card = Card.objects.create(column=self.todo, title="Write tests")
+
+    def test_member_adds_subtask(self):
+        self.login(self.member)
+
+        response = self.client.post(
+            f"/api/cards/{self.card.id}/subtasks/", {"title": "Auth tests"}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(response.data["is_completed"])
+
+    def test_viewer_cannot_add_subtask(self):
+        self.login(self.viewer)
+
+        response = self.client.post(
+            f"/api/cards/{self.card.id}/subtasks/", {"title": "Auth tests"}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_ticking_subtask_updates_board_progress(self):
+        subtask = Subtask.objects.create(card=self.card, title="Auth tests")
+        Subtask.objects.create(card=self.card, title="Board tests")
+
+        response = self.client.patch(f"/api/subtasks/{subtask.id}/", {"is_completed": True})
+        board = self.client.get(f"/api/boards/{self.board.id}/").data
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        card_on_board = board["columns"][0]["cards"][0]
+        self.assertEqual(card_on_board["subtasks_total"], 2)
+        self.assertEqual(card_on_board["subtasks_done"], 1)
+
+    def test_member_deletes_subtask(self):
+        subtask = Subtask.objects.create(card=self.card, title="Auth tests")
+        self.login(self.member)
+
+        response = self.client.delete(f"/api/subtasks/{subtask.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Subtask.objects.filter(pk=subtask.id).exists())
